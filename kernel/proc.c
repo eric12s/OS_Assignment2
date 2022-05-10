@@ -25,7 +25,6 @@ extern char trampoline[]; // trampoline.S
 // memory model when using p->parent.
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
-
 extern uint64 cas(volatile void *addr, int expected, int newval);
 
 // Allocate a page for each process's kernel stack.
@@ -651,4 +650,90 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+int get_num_of_cpu() {
+    int num_of_cpu = -99;
+    struct proc *proc = myproc();
+    acquire(&proc->lock);
+    num_of_cpu = proc->num_of_cpu;
+    release(&proc->lock);
+    return num_of_cpu;
+}
+
+int set_num_of_cpu(int num_of_cpu) {
+    struct proc* proc = myproc();
+    if(cas(&proc->num_of_cpu, proc->num_of_cpu, num_of_cpu) != 0)
+        return -1;
+
+    yield();
+    return num_of_cpu;
+}
+
+int push_link(volatile int* first_id, struct proc* proc, struct spinlock* lock) {
+    int result;
+    acquire(lock);
+    if(*first_id == -1){
+        result = cas(first_id, -1, proc->index) == 0;
+        release(lock);
+        return result;
+    }
+    acquire(&proc[*first_id].item_lock);
+    release(lock);
+    result = func_push_to_list(&proc[*first_id], proc);
+    return result;
+}
+
+int func_push_link(struct proc* curr, struct proc* proc) {
+    int result;
+    if(curr->next_proc == -1){
+        result = cas(&curr->next_proc, -1, proc->index) == 0;
+        release(&curr->item_lock);
+        return result;
+    }
+    acquire(&proc[curr->next_proc].item_lock);
+    release(&curr->item_lock);
+    return func_push_to_list(&proc[curr->next_proc], proc);
+}
+
+int delete_link(volatile int* first_id, struct proc* proc, struct spinlock* lock) {
+    int result;
+    acquire(lock);
+    acquire(&proc->item_lock);
+    if(*first_id == -1)
+    {
+        release(lock);
+        release(&proc->item_lock);
+        return -1;
+    }
+    if(*first_id == proc->index){
+        result = cas(first_id, proc->index, proc->next_proc) == 0;
+        proc->next_proc = -1;
+        release(&proc->item_lock);
+        release(lock);
+        return result;
+    }
+    release(&proc->item_lock);
+    acquire(&proc[*first_id].item_lock);
+    release(lock);
+    result = func_delete_from_list(&proc[*first_id], proc);
+
+    return result;
+
+}
+
+int func_delete_link(struct proc* curr_proc, struct proc* remove_proc){
+    int result;
+    if(curr_proc->next_proc == remove_proc->index){
+        acquire(&remove_proc->item_lock);
+        result = cas(&curr_proc->next_proc, remove_proc->index, remove_proc->next_proc) == 0;
+        remove_proc->next_proc = -1;
+        release(&remove_proc->item_lock);
+        release(&curr_proc->item_lock);
+        return result;
+    }
+    acquire(&proc[curr_proc->next_proc].item_lock);
+    release(&curr_proc->item_lock);
+
+    return func_delete_from_list(&proc[curr_proc->next_proc], remove_proc);
 }

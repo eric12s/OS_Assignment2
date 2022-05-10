@@ -105,6 +105,13 @@ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
 
+int             get_num_of_cpu();
+int             set_num_of_cpu(int num_of_cpu);
+int             push_link(volatile int*, struct proc*, struct spinlock*);
+int             func_push_link(struct proc*, struct proc*);
+int             delete_link(volatile int*, struct proc*, struct spinlock*);
+int             func_delete_link(struct proc*, struct proc*);
+
 // swtch.S
 void            swtch(struct context*, struct context*);
 
