@@ -107,11 +107,9 @@ void            procdump(void);
 
 int             get_num_of_cpu();
 int             set_num_of_cpu(int num_of_cpu);
-int             push_link(volatile int*, struct proc*, struct spinlock*);
-int             func_push_link(struct proc*, struct proc*);
-int             delete_link(volatile int*, struct proc*, struct spinlock*);
-int             func_delete_link(struct proc*, struct proc*);
-
+void            push_link(int*, struct proc*, struct spinlock*);
+int             delete_link(int*, struct proc*, struct spinlock*);
+int             choose_cpu();
 // swtch.S
 void            swtch(struct context*, struct context*);
 

@@ -22,9 +22,12 @@ struct context {
 struct cpu {
   struct proc *proc;          // The process running on this cpu, or null.
   struct context context;     // swtch() here to enter scheduler().
+  struct spinlock head_lock;
   int noff;                   // Depth of push_off() nesting.
   int intena;                 // Were interrupts enabled before push_off()?
-  volatile int current_proc;
+
+  int first_runnable_proc;
+  volatile uint64 processes_counter;
 };
 
 extern struct cpu cpus[NCPU];

@@ -27,6 +27,21 @@ extern char trampoline[]; // trampoline.S
 struct spinlock wait_lock;
 extern uint64 cas(volatile void *addr, int expected, int newval);
 
+
+#ifdef OFF
+int balance_mode = 0;
+#else
+int balance_mode = 1;
+#endif
+
+int cpus_counter = 0;
+int first_unused_proc = -1;
+int first_sleeping_proc = -1;
+int first_zombie_proc = -1;
+struct spinlock unused_lock;
+struct spinlock sleeping_lock;
+struct spinlock zombie_lock;
+
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
 // guard page.
@@ -48,12 +63,27 @@ void
 procinit(void)
 {
   struct proc *p;
-  
+  initlock(&unused_lock, "unused");
+  initlock(&sleeping_lock, "sleeping");
+  initlock(&zombie_lock, "zombie");
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
+  int index = -1;
+
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
+      initlock(&p->item_lock, "item");
+      p->index = index;
+      p->next_proc = -1;
       p->kstack = KSTACK((int) (p - proc));
+      push_link(&first_unused_proc, p, &unused_lock);
+      index++;
+  }
+  struct cpu *cpusTmp;
+  for(cpusTmp = cpus; cpusTmp < &cpus[NCPU]; cpusTmp++) {
+    cpusTmp->first_runnable_proc = -1;
+    // cpusTmp->num_of_procces = 0;
+    initlock(&cpusTmp->head_lock, "runnable");
   }
 }
 
@@ -103,20 +133,17 @@ allocproc(void)
 {
   struct proc *p;
 
-  for(p = proc; p < &proc[NPROC]; p++) {
+  if (first_unused_proc != -1) {
+    p = &proc[first_unused_proc];
     acquire(&p->lock);
-    if(p->state == UNUSED) {
-      goto found;
-    } else {
-      release(&p->lock);
-    }
+    goto found;
   }
   return 0;
 
 found:
   p->pid = allocpid();
   p->state = USED;
-
+  delete_link(&first_unused_proc, p, &unused_lock);
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     freeproc(p);
@@ -151,7 +178,9 @@ freeproc(struct proc *p)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
   if(p->pagetable)
-    proc_freepagetable(p->pagetable, p->sz);
+  proc_freepagetable(p->pagetable, p->sz);
+  delete_link(&first_zombie_proc, p, &zombie_lock);
+  push_link(&first_unused_proc, p, &unused_lock);
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
@@ -240,7 +269,7 @@ userinit(void)
   p->cwd = namei("/");
 
   p->state = RUNNABLE;
-
+  push_link(&cpus[0].first_runnable_proc, p, &cpus[0].head_lock);
   release(&p->lock);
 }
 
@@ -306,10 +335,17 @@ fork(void)
 
   acquire(&wait_lock);
   np->parent = p;
+  if (balance_mode) {
+    np->num_of_cpu = choose_cpu();
+  } else {
+    np->num_of_cpu = p->num_of_cpu;
+  }
+    
   release(&wait_lock);
 
   acquire(&np->lock);
   np->state = RUNNABLE;
+  push_link(&cpus[np->num_of_cpu].first_runnable_proc, np, &cpus[np->num_of_cpu].head_lock);
   release(&np->lock);
 
   return pid;
@@ -367,6 +403,7 @@ exit(int status)
 
   p->xstate = status;
   p->state = ZOMBIE;
+  push_link(&first_zombie_proc, p, &zombie_lock);
 
   release(&wait_lock);
 
@@ -442,20 +479,17 @@ scheduler(void)
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
 
-    for(p = proc; p < &proc[NPROC]; p++) {
+    while (c->first_runnable_proc != -1) {
+      p = &proc[c->first_runnable_proc];
       acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
+      delete_link(&c->first_runnable_proc, p, &c->head_lock);
+  
+      p->state = RUNNING;
+      c->proc = p;
+      swtch(&c->context, &p->context);
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-      }
+      // add_proc_to_list(&c->first_runnable_proc, p, &c->head_lock);
+      c->proc = 0;
       release(&p->lock);
     }
   }
@@ -494,6 +528,8 @@ yield(void)
 {
   struct proc *p = myproc();
   acquire(&p->lock);
+  volatile int num_of_cpu = p->num_of_cpu;
+  push_link(&cpus[num_of_cpu].first_runnable_proc, p, &cpus[num_of_cpu].head_lock);
   p->state = RUNNABLE;
   sched();
   release(&p->lock);
@@ -536,11 +572,13 @@ sleep(void *chan, struct spinlock *lk)
 
   acquire(&p->lock);  //DOC: sleeplock1
   release(lk);
-
   // Go to sleep.
   p->chan = chan;
   p->state = SLEEPING;
 
+  while(cas(&cpus[p->num_of_cpu].processes_counter, cpus[p->num_of_cpu].processes_counter, cpus[p->num_of_cpu].processes_counter - 1) != 0);
+
+  push_link(&first_sleeping_proc, p, &sleeping_lock);
   sched();
 
   // Tidy up.
@@ -557,12 +595,21 @@ void
 wakeup(void *chan)
 {
   struct proc *p;
-
   for(p = proc; p < &proc[NPROC]; p++) {
     if(p != myproc()){
       acquire(&p->lock);
       if(p->state == SLEEPING && p->chan == chan) {
+        delete_link(&first_sleeping_proc, p, &sleeping_lock);
         p->state = RUNNABLE;
+
+        if (balance_mode) {
+          p->num_of_cpu = choose_cpu();
+          volatile int num_of_cpu = p->num_of_cpu;
+          while(cas(&cpus[num_of_cpu].processes_counter, cpus[num_of_cpu].processes_counter, cpus[num_of_cpu].processes_counter + 1) != 0);
+        } else {
+          p->num_of_cpu = p->num_of_cpu;
+        } 
+        push_link(&cpus[p->num_of_cpu].first_runnable_proc, p, &cpus[p->num_of_cpu].head_lock);
       }
       release(&p->lock);
     }
@@ -576,14 +623,15 @@ int
 kill(int pid)
 {
   struct proc *p;
-
   for(p = proc; p < &proc[NPROC]; p++){
     acquire(&p->lock);
     if(p->pid == pid){
       p->killed = 1;
       if(p->state == SLEEPING){
+        delete_link(&first_sleeping_proc, p, &sleeping_lock);
         // Wake process from sleep().
         p->state = RUNNABLE;
+        push_link(&cpus[p->num_of_cpu].first_runnable_proc, p, &cpus[p->num_of_cpu].head_lock);
       }
       release(&p->lock);
       return 0;
@@ -670,70 +718,78 @@ int set_num_of_cpu(int num_of_cpu) {
     return num_of_cpu;
 }
 
-int push_link(volatile int* first_id, struct proc* proc, struct spinlock* lock) {
-    int result;
+void push_link(int* first_id, struct proc* to_add, struct spinlock* lock) {
     acquire(lock);
-    if(*first_id == -1){
-        result = cas(first_id, -1, proc->index) == 0;
+    if (*first_id != -1){
+        struct proc *prev_proc;
+        struct proc *curr_proc = &to_add[*first_id];
+        acquire(&curr_proc->item_lock);
         release(lock);
-        return result;
+        while (curr_proc->next_proc != -1){
+            prev_proc = curr_proc;
+            curr_proc = &to_add[curr_proc->next_proc];
+            acquire(&curr_proc->item_lock);
+            release(&prev_proc->item_lock);
+        }
+        curr_proc->next_proc = to_add->index;
+        to_add->next_proc = -1;
+        release(&curr_proc->item_lock);
     }
-    acquire(&proc[*first_id].item_lock);
-    release(lock);
-    result = func_push_to_list(&proc[*first_id], proc);
-    return result;
+    else{
+        *first_id = to_add->index;
+        to_add->next_proc = -1;
+        release(lock);
+        return;
+    }
 }
 
-int func_push_link(struct proc* curr, struct proc* proc) {
-    int result;
-    if(curr->next_proc == -1){
-        result = cas(&curr->next_proc, -1, proc->index) == 0;
-        release(&curr->item_lock);
-        return result;
-    }
-    acquire(&proc[curr->next_proc].item_lock);
-    release(&curr->item_lock);
-    return func_push_to_list(&proc[curr->next_proc], proc);
-}
-
-int delete_link(volatile int* first_id, struct proc* proc, struct spinlock* lock) {
-    int result;
+int delete_link(int* first_id, struct proc* to_remove, struct spinlock* lock) {
+    struct proc *curr_proc;
+    struct proc *prev_proc;
     acquire(lock);
-    acquire(&proc->item_lock);
-    if(*first_id == -1)
-    {
+    if (*first_id == -1){
         release(lock);
-        release(&proc->item_lock);
         return -1;
     }
-    if(*first_id == proc->index){
-        result = cas(first_id, proc->index, proc->next_proc) == 0;
-        proc->next_proc = -1;
-        release(&proc->item_lock);
+
+    curr_proc = &proc[*first_id];
+    acquire(&curr_proc->item_lock);
+    if (curr_proc->index == to_remove->index){
+        *first_id = to_remove->next_proc;
+        to_remove->next_proc = -1;
+        release(&curr_proc->item_lock);
         release(lock);
-        return result;
+        return 1;
     }
-    release(&proc->item_lock);
-    acquire(&proc[*first_id].item_lock);
+
     release(lock);
-    result = func_delete_from_list(&proc[*first_id], proc);
-
-    return result;
-
+    while (curr_proc->next_proc != to_remove->index){
+        if (curr_proc->next_proc  == -1){
+            release(&curr_proc->item_lock);
+            return -1;
+        }
+        prev_proc = curr_proc;
+        curr_proc = &proc[prev_proc->next_proc];
+        acquire(&curr_proc->item_lock);
+        release(&prev_proc->item_lock);
+    }
+    acquire(&to_remove->item_lock);
+    curr_proc->next_proc = to_remove->next_proc;
+    to_remove->next_proc = -1;
+    release(&to_remove->item_lock);
+    release(&curr_proc->item_lock);
+    return 1;
 }
 
-int func_delete_link(struct proc* curr_proc, struct proc* remove_proc){
-    int result;
-    if(curr_proc->next_proc == remove_proc->index){
-        acquire(&remove_proc->item_lock);
-        result = cas(&curr_proc->next_proc, remove_proc->index, remove_proc->next_proc) == 0;
-        remove_proc->next_proc = -1;
-        release(&remove_proc->item_lock);
-        release(&curr_proc->item_lock);
-        return result;
+int choose_cpu() {
+    int cpu = 0;
+    int min = cpus[0].processes_counter;
+    int i;
+    for (i = 1; i < cpus_counter; i++){
+        if (min > cpus[i].processes_counter){
+            min = cpus[i].processes_counter;
+            cpu = i;
+        }
     }
-    acquire(&proc[curr_proc->next_proc].item_lock);
-    release(&curr_proc->item_lock);
-
-    return func_delete_from_list(&proc[curr_proc->next_proc], remove_proc);
+    return cpu;
 }
