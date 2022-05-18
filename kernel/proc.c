@@ -742,43 +742,45 @@ void push_link(int* first_id, struct proc* to_add, struct spinlock* lock) {
         return;
     }
 }
-
 int delete_link(int* first_id, struct proc* to_remove, struct spinlock* lock) {
-    struct proc *curr_proc;
     struct proc *prev_proc;
     acquire(lock);
-    if (*first_id == -1){
+    if(*first_id != -1){
+        struct proc *curr_proc = &proc[*first_id];
+        acquire(&curr_proc->node_lock);
+        if (curr_proc->proc_index != to_remove->proc_index){
+            release(lock);
+            while (curr_proc->next_proc_id != to_remove->proc_index){
+                if (curr_proc->next_proc_id  != -1){
+                    prev_proc = curr_proc;
+                    curr_proc = &proc[prev_proc->next_proc_id];
+                    release(&prev_proc->node_lock);
+                    acquire(&curr_proc->node_lock);
+                }
+                else{
+                    release(&curr_proc->node_lock);
+                    return -1;
+                }
+            }
+            acquire(&to_remove->node_lock);
+            curr_proc->next_proc_id = to_remove->next_proc_id;
+            to_remove->next_proc_id = -1;
+            release(&curr_proc->node_lock);
+            release(&to_remove->node_lock);
+            return 1;
+        }
+        else{
+            *first_id = to_remove->next_proc_id;
+            to_remove->next_proc_id = -1;
+            release(lock);
+            release(&curr_proc->node_lock);
+            return 1;
+        }
+    }
+    else{
         release(lock);
         return -1;
     }
-
-    curr_proc = &proc[*first_id];
-    acquire(&curr_proc->item_lock);
-    if (curr_proc->index == to_remove->index){
-        *first_id = to_remove->next_proc;
-        to_remove->next_proc = -1;
-        release(&curr_proc->item_lock);
-        release(lock);
-        return 1;
-    }
-
-    release(lock);
-    while (curr_proc->next_proc != to_remove->index){
-        if (curr_proc->next_proc  == -1){
-            release(&curr_proc->item_lock);
-            return -1;
-        }
-        prev_proc = curr_proc;
-        curr_proc = &proc[prev_proc->next_proc];
-        acquire(&curr_proc->item_lock);
-        release(&prev_proc->item_lock);
-    }
-    acquire(&to_remove->item_lock);
-    curr_proc->next_proc = to_remove->next_proc;
-    to_remove->next_proc = -1;
-    release(&to_remove->item_lock);
-    release(&curr_proc->item_lock);
-    return 1;
 }
 
 int choose_cpu() {
